@@ -1,0 +1,162 @@
+name: VersoriumX Universal Sentinel
+
+on:
+  push:
+    branches: [ "**" ]          # any branch
+  pull_request:
+    branches: [ "**" ]
+  schedule:
+    - cron: ${{ fromJson(steps.config.outputs.scan_schedule) }}   # default 0 3 * * *
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  security-events: write
+  actions: read
+
+jobs:
+  sentinel:
+    runs-on: ubuntu-latest
+    steps:
+      # -------------------------------------------------
+      # 1️⃣ Checkout repository
+      # -------------------------------------------------
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # -------------------------------------------------
+      # 2️⃣ Parse Sentinel markdown for overrides
+      # -------------------------------------------------
+      - name: Parse Sentinel config
+        id: config
+        run: |
+          #!/usr/bin/env node
+          const fs = require('fs');
+          const md = fs.readFileSync('SECURITY-SENTINEL.md', 'utf8');
+          const table = md.match(/\|[\s\S]*?\|/);
+          const defaults = {
+            "malware-signatures": "https://raw.githubusercontent.com/VersoriumX/malware-db/main/signatures.json",
+            "quarantine-branch": "sentinel/quarantine",
+            "warning-message": "VersoriumX security Panel has quarantined your activity",
+            "dependency-updater": "renovate",
+            "scan-schedule": "0 3 * * *"
+          };
+          const cfg = {...defaults};
+          if (table) {
+            const rows = table[0].trim().split('\n').slice(2);
+            rows.forEach(r => {
+              const [, key, value] = r.split('|').map(s=>s.trim());
+              if (key) cfg[key] = value || cfg[key];
+            });
+          }
+          console.log('::set-output name=malware_url::' + cfg['malware-signatures']);
+          console.log('::set-output name=quarantine_branch::' + cfg['quarantine-branch']);
+          console.log('::set-output name=warning_message::' + cfg['warning-message']);
+          console.log('::set-output name=dep_updater::' + cfg['dependency-updater']);
+          console.log('::set-output name=scan_schedule::' + cfg['scan-schedule']);
+
+      # -------------------------------------------------
+      # 3️⃣ Install generic tools (Trivy, jq, curl)
+      # -------------------------------------------------
+      - name: Install utilities
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq curl
+          curl -sfL https://raw.githubusercontent.com/aquasecurity, 
+          # install Trivy
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+
+      # -------------------------------------------------
+      # 4️⃣ Run language‑specific scans (auto‑detect)
+      # -------------------------------------------------
+      - name: Language‑specific scans
+        id: lang_scans
+        run: |
+          mkdir -p sarif-results
+
+          # Clojure – clj‑watson
+          if [ -f deps.edn ]; then
+            echo "Running clj‑watson..."
+            curl -sSL https://raw.githubusercontent.com/clj-holmes/clj-watson-action/main/entrypoint.sh > /tmp/watson.sh
+            bash /tmp/watson.sh \
+              --clj-watson-sha 65d928c \
+              --clj-watson-tag v4.0.1 \
+              --database-strategy github-advisory \
+              --aliases clojure-lsp,test \
+              --deps-edn-path deps.edn \
+              --suggest-fix true \
+              --output-type sarif \
+              --output-file sarif-results/clj-watson.sarserif \
+              --fail-on-result false
+          fi
+
+          # Node.js – npm audit
+          if [ -f package.json ]; then
+            echo "Running npm audit..."
+            npm install --package-lock-only
+            npm audit --json > audit.json || true
+            npx @microsoft/sarif-multitool convert -i audit.json -f npm-audit -o sarif-results/npm-audit.sarif
+          fi
+
+          # Python – pip‑audit
+          if [ -f requirements.txt ] || [ -f pyproject.toml ]; then
+            echo "Running pip‑audit..."
+            python -m pip install --upgrade pip pip-audit
+            pip-audit -r requirements.txt -f sarif -o sarif-results/pip-audit.sarif || true
+          fi
+
+          # Go – govulncheck
+          if [ -f go.mod ]; then
+            echo "Running govulncheck..."
+            go install golang.org/x/vuln/cmd/govulncheck@latest
+            govulncheck -format sarif -out sarif-results/go-vuln.sarif ./... || true
+          fi
+
+      # -------------------------------------------------
+      # (Trivy) – generic filesystem & malware scan
+      # -------------------------------------------------
+      - name: Trivy scan
+        run: |
+          trivy fs --security-checks vuln,config,secret \
+            --format sarif \
+            --output sarif-results/trivy.sarif .
+
+      # -------------------------------------------------
+      # 5️⃣ Upload all SARIF files to GitHub Security tab
+      # -------------------------------------------------
+      - name: Upload SARIF results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: |
+            sarif-results/*.sarif
+          wait-for-processing: true
+
+      # -------------------------------------------------
+      # 6️⃣ Dependency‑upgrade PR (Renovate or Dependabot)
+      # -------------------------------------------------
+      - name: Enable automatic upgrades
+        if: ${{ steps.config.outputs.dep_updater == 'renovate' }}
+        uses: renovatebot/github-action@v40
+        with:
+          configurationFile: .github/renovate.json
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Enable Dependabot (fallback)
+        if: ${{ steps.config.outputs.dep_updater != 'renovate' }}
+        run: |
+          echo "Dependabot is built‑in; ensure a .github/dependabot.yml exists in the repo."
+
+      # -------------------------------------------------
+      # 7️⃣ Mousetrap – quarantine prohibited code & warn
+      # -------------------------------------------------
+      - name: Mousetrap quarantine
+        id: mousetrap
+        env:
+          QUARANTINE_BRANCH: ${{ steps.config.outputs.quarantine_branch }}
+          WARNING_MSG: ${{ steps.config.outputs.warning_message }}
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # Patterns that indicate piracy,
